@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$PROJECT_DIR"
+
+FLUTTER_BIN="${FLUTTER_BIN:-flutter}"
+DART_BIN="${DART_BIN:-dart}"
+
+bold=""
+green=""
+muted=""
+reset=""
+if [[ -t 1 ]]; then
+  bold=$'\033[1m'
+  green=$'\033[32m'
+  muted=$'\033[90m'
+  reset=$'\033[0m'
+fi
+
+fail() {
+  printf '%sError:%s %s\n' "$bold" "$reset" "$*" >&2
+  return 1
+}
+
+need_flutter() {
+  command -v "$FLUTTER_BIN" >/dev/null 2>&1 || fail "Flutter tidak ditemukan. Pastikan Flutter ada di PATH."
+}
+
+need_dart() {
+  command -v "$DART_BIN" >/dev/null 2>&1 || fail "Dart tidak ditemukan. Pastikan Dart ada di PATH."
+}
+
+ensure_pub_ready() {
+  need_flutter
+  if [[ ! -f .dart_tool/package_config.json || ! -f pubspec.lock || pubspec.yaml -nt pubspec.lock || pubspec.lock -nt .dart_tool/package_config.json ]]; then
+    printf '%sMengambil dependency Flutter…%s\n' "$muted" "$reset"
+    "$FLUTTER_BIN" pub get
+  fi
+}
+
+generate_database() {
+  ensure_pub_ready
+  need_dart
+  printf '%sMembuat binding Drift…%s\n' "$muted" "$reset"
+  "$DART_BIN" run build_runner build
+}
+
+ensure_project_ready() {
+  ensure_pub_ready
+  if [[ ! -f lib/src/data/local/app_database.g.dart ]]; then
+    generate_database
+  fi
+}
+
+ios_safe_workdir() {
+  printf '%s' "${SKAKKING_IOS_WORKDIR:-/private/tmp/catur-mate-ios}"
+}
+
+prepare_ios_workspace() {
+  [[ "$PROJECT_DIR" == *"("* ]] || return 0
+
+  local safe_dir
+  safe_dir="$(ios_safe_workdir)"
+  if [[ "$safe_dir" == *"("* || "$safe_dir" == "$PROJECT_DIR" || "$safe_dir" == "$PROJECT_DIR/"* ]]; then
+    fail "SKAKKING_IOS_WORKDIR harus berupa path di luar proyek tanpa tanda kurung."
+    return 1
+  fi
+  command -v rsync >/dev/null 2>&1 || {
+    fail "rsync diperlukan untuk menyiapkan workspace iOS yang aman."
+    return 1
+  }
+
+  mkdir -p "$safe_dir"
+  rsync -a --delete \
+    --exclude='/.git/' \
+    --exclude='/.agents/' \
+    --exclude='/.codex/' \
+    --exclude='/.dart_tool/' \
+    --exclude='/build/' \
+    --exclude='/.flutter-plugins-dependencies' \
+    --exclude='/ios/Flutter/ephemeral/' \
+    --exclude='/ios/Flutter/Generated.xcconfig' \
+    --exclude='/ios/Flutter/flutter_export_environment.sh' \
+    --exclude='/flutter_*.log' \
+    "$PROJECT_DIR/" "$safe_dir/"
+
+  cd "$safe_dir"
+  printf '%sMenyiapkan workspace iOS sementara untuk menghindari bug Flutter pada path bertanda kurung.%s\n' "$muted" "$reset"
+}
+
+list_ios_simulators() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    fail "Daftar simulator iOS hanya tersedia di macOS dengan Xcode."
+    return 1
+  fi
+  command -v xcrun >/dev/null 2>&1 || {
+    fail "xcrun tidak ditemukan. Pasang Xcode dan jalankan xcode-select --install."
+    return 1
+  }
+  xcrun simctl list devices available
+}
+
+select_ios_simulator() {
+  local selector="${1:-}"
+  local simulator_json
+  simulator_json="$(xcrun simctl list devices available --json)" || return 1
+
+  python3 -c '
+import json, re, sys
+
+selector = sys.argv[1].strip().lower()
+data = json.load(sys.stdin)
+
+def version(runtime):
+    found = re.search(r"iOS-(\d+)-(\d+)", runtime)
+    return tuple(map(int, found.groups())) if found else (0, 0)
+
+devices = []
+for runtime, entries in data.get("devices", {}).items():
+    for device in entries:
+        if device.get("isAvailable", True):
+            devices.append((runtime, device))
+
+if selector:
+    exact_id = [item for item in devices if item[1].get("udid", "").lower() == selector]
+    exact_name = [item for item in devices if item[1].get("name", "").lower() == selector]
+    partial = [item for item in devices if selector in item[1].get("name", "").lower()]
+    matches = exact_id or exact_name or partial
+    matches.sort(key=lambda item: version(item[0]), reverse=True)
+    chosen = matches[0] if matches else None
+else:
+    booted_iphones = [item for item in devices if item[1].get("state") == "Booted" and item[1].get("name", "").startswith("iPhone")]
+    booted_iphones.sort(key=lambda item: version(item[0]), reverse=True)
+    iphones = [item for item in devices if item[1].get("name", "").startswith("iPhone")]
+    iphones.sort(key=lambda item: version(item[0]), reverse=True)
+    chosen = (booted_iphones or iphones or devices or [None])[0]
+
+if chosen is None:
+    sys.exit(2)
+runtime, device = chosen
+print("\t".join((device["udid"], device["name"], device.get("state", "Shutdown"))))
+' "$selector" <<< "$simulator_json"
+}
+
+run_ios() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    fail "Menjalankan simulator iOS membutuhkan macOS dan Xcode."
+    return 1
+  fi
+  command -v xcrun >/dev/null 2>&1 || {
+    fail "xcrun tidak ditemukan. Pasang Xcode dan jalankan xcode-select --install."
+    return 1
+  }
+  command -v python3 >/dev/null 2>&1 || {
+    fail "python3 diperlukan untuk memilih simulator dari daftar Xcode."
+    return 1
+  }
+
+  local selector="${1:-}"
+  if [[ "$selector" == "--list" || "$selector" == "list" ]]; then
+    list_ios_simulators
+    return
+  fi
+
+  local sim_info device_id device_name device_state
+  if ! sim_info="$(select_ios_simulator "$selector")"; then
+    fail "Simulator '${selector:-iPhone}' tidak ditemukan. Jalankan './skakking devices' untuk daftar simulator."
+    return 1
+  fi
+  IFS=$'\t' read -r device_id device_name device_state <<< "$sim_info"
+
+  if [[ "$PROJECT_DIR" == *"("* ]]; then
+    ensure_project_ready
+    prepare_ios_workspace || return 1
+    ensure_pub_ready
+  else
+    ensure_project_ready
+  fi
+
+  printf '%sSimulator:%s %s\n' "$bold" "$reset" "$device_name"
+  if [[ "$device_state" != "Booted" ]]; then
+    printf '%sMenyalakan simulator…%s\n' "$muted" "$reset"
+    xcrun simctl boot "$device_id"
+  fi
+  xcrun simctl bootstatus "$device_id" -b
+  open -a Simulator --args -CurrentDeviceUDID "$device_id" >/dev/null 2>&1 || true
+
+  printf '%sMenjalankan Catur Mate di %s…%s\n' "$green" "$device_name" "$reset"
+  "$FLUTTER_BIN" run --no-pub --device-timeout 120 -d "$device_id"
+}
+
+run_android() {
+  ensure_project_ready
+  local device="${1:-}"
+  if [[ -n "$device" ]]; then
+    "$FLUTTER_BIN" run --no-pub -d "$device"
+  else
+    "$FLUTTER_BIN" run --no-pub
+  fi
+}
+
+build_apk() {
+  ensure_project_ready
+  "$FLUTTER_BIN" build apk --release --no-pub
+}
+
+build_appbundle() {
+  ensure_project_ready
+  "$FLUTTER_BIN" build appbundle --release --no-pub
+}
+
+build_ios_simulator() {
+  if [[ "$PROJECT_DIR" == *"("* ]]; then
+    ensure_project_ready
+    prepare_ios_workspace || return 1
+    ensure_pub_ready
+  else
+    ensure_project_ready
+  fi
+  "$FLUTTER_BIN" build ios --simulator --no-codesign --no-pub
+}
+
+clean_project() {
+  need_flutter
+  "$FLUTTER_BIN" clean
+  if [[ "$PROJECT_DIR" == *"("* ]]; then
+    local safe_dir
+    safe_dir="$(ios_safe_workdir)"
+    if [[ -f "$safe_dir/pubspec.yaml" ]]; then
+      (cd "$safe_dir" && "$FLUTTER_BIN" clean)
+    fi
+  fi
+}
+
+show_devices() {
+  need_flutter
+  "$FLUTTER_BIN" devices
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v xcrun >/dev/null 2>&1; then
+    printf '\n%sSimulator iOS tersedia:%s\n' "$bold" "$reset"
+    xcrun simctl list devices available
+  fi
+}
+
+show_help() {
+  cat <<'HELP'
+Catur Mate — shortcut Flutter
+
+Pemakaian:
+  ./skakking menu                 Buka menu interaktif (default)
+  ./skakking ios [simulator]      Jalankan di simulator iOS; default iPhone tersedia/aktif
+  ./skakking android [device-id]  Jalankan di perangkat/emulator Android
+  ./skakking run ios [simulator]  Alias eksplisit untuk menjalankan iOS
+  ./skakking devices              Tampilkan perangkat Flutter dan simulator iOS
+  ./skakking analyze              Jalankan flutter analyze
+  ./skakking test                 Jalankan flutter test
+  ./skakking generate             Buat ulang file Drift dengan build_runner
+  ./skakking pub                  Jalankan flutter pub get
+  ./skakking build apk            Build APK release
+  ./skakking build appbundle     Build Android App Bundle release
+  ./skakking build ios-sim       Build iOS Simulator tanpa signing
+  ./skakking clean                Jalankan flutter clean
+  ./skakking doctor               Jalankan flutter doctor -v
+  ./skakking help                 Tampilkan bantuan
+
+Contoh:
+  ./skakking ios
+  ./skakking ios "iPhone Pro"
+  ./skakking android
+HELP
+}
+
+run_menu_action() {
+  case "$1" in
+    1) run_ios ;;
+    2) run_android ;;
+    3) need_flutter && "$FLUTTER_BIN" analyze ;;
+    4) ensure_project_ready && "$FLUTTER_BIN" test --no-pub ;;
+    5) generate_database ;;
+    6) need_flutter && "$FLUTTER_BIN" pub get ;;
+    7) build_apk ;;
+    8) build_ios_simulator ;;
+    9) build_appbundle ;;
+    10) show_devices ;;
+    11) need_flutter && "$FLUTTER_BIN" doctor -v ;;
+    12) clean_project ;;
+    q|Q|0) return 2 ;;
+    *) printf 'Pilihan tidak dikenal. Pilih 1–12 atau q.\n' ;;
+  esac
+}
+
+menu() {
+  while true; do
+    printf '\n%s♞ CATUR MATE%s  %sFlutter command menu%s\n' "$bold" "$reset" "$muted" "$reset"
+    printf '  1  Jalankan iOS Simulator\n'
+    printf '  2  Jalankan Android\n'
+    printf '  3  Analyze\n'
+    printf '  4  Test\n'
+    printf '  5  Generate Drift\n'
+    printf '  6  Pub get\n'
+    printf '  7  Build APK release\n'
+    printf '  8  Build iOS Simulator\n'
+    printf '  9  Build Android App Bundle\n'
+    printf ' 10  Daftar devices\n'
+    printf ' 11  Flutter doctor\n'
+    printf ' 12  Flutter clean\n'
+    printf '  q  Keluar\n\n'
+    read -r -p 'Pilih perintah > ' choice || return 0
+    if run_menu_action "$choice"; then
+      :
+    else
+      local status=$?
+      if [[ "$status" -eq 2 ]]; then return 0; fi
+    fi
+    printf '\n'
+    read -r -p 'Tekan Enter untuk kembali ke menu…' _ || return 0
+  done
+}
+
+command_name="${1:-menu}"
+if [[ $# -gt 0 ]]; then shift; fi
+
+case "$command_name" in
+  menu) menu ;;
+  ios|run-ios) run_ios "$@" ;;
+  android|run-android) run_android "$@" ;;
+  run)
+    case "${1:-}" in
+      ios) shift; run_ios "$@" ;;
+      android) shift; run_android "$@" ;;
+      *) show_help; fail "Pilih target run: ios atau android." ;;
+    esac
+    ;;
+  devices) show_devices ;;
+  ios-devices) list_ios_simulators ;;
+  analyze|check) need_flutter; "$FLUTTER_BIN" analyze ;;
+  test) ensure_project_ready; "$FLUTTER_BIN" test --no-pub ;;
+  generate|gen) generate_database ;;
+  pub) need_flutter; "$FLUTTER_BIN" pub get ;;
+  build-apk) build_apk ;;
+  build-appbundle) build_appbundle ;;
+  build-ios-sim) build_ios_simulator ;;
+  build)
+    case "${1:-}" in
+      apk) shift; build_apk ;;
+      appbundle|aab) shift; build_appbundle ;;
+      ios-sim|ios-simulator) shift; build_ios_simulator ;;
+      *) show_help; fail "Pilih target build: apk, appbundle, atau ios-sim." ;;
+    esac
+    ;;
+  clean) clean_project ;;
+  doctor) need_flutter; "$FLUTTER_BIN" doctor -v ;;
+  help|-h|--help) show_help ;;
+  *) show_help; fail "Perintah '$command_name' tidak dikenal." ;;
+esac
